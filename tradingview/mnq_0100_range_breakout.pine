@@ -1,0 +1,222 @@
+//@version=6
+// MNQ 01:00–01:15 New York range breakout, target 0.5R, stop on the other side of the range.
+// Chart: MNQ1! on 5 minutes. Pick ONE regime filter at a time and compare against the baseline (filter 0).
+// Every filter only uses data of the previous, completed daily bar -> no look-ahead / no repainting.
+strategy("MNQ 01:00 NY Range Breakout (0.5R)", shorttitle = "MNQ 0100 RB", overlay = true,
+     initial_capital = 10000, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.85,
+     slippage = 1, process_orders_on_close = false, use_bar_magnifier = true)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+const string TZ     = "America/New_York"
+const string G_CORE = "Core rules"
+const string G_SIZE = "Position sizing"
+const string G_DATE = "Backtest window (use for in-sample / out-of-sample split)"
+const string G_F    = "Regime filter – test ONE at a time"
+
+const string F0 = "0 None (baseline)"
+const string F1 = "1 Daily trend (close vs EMA)"
+const string F2 = "2 Volatility expansion (ATR short / ATR long)"
+const string F3 = "3 Range size vs daily ATR"
+const string F4 = "4 VIX level"
+const string F5 = "5 Daily trend strength (ADX)"
+
+rangeSess = input.session("0100-0115", "Range window (NY time)", group = G_CORE)
+entrySess = input.session("0115-1200", "Entry window (NY time)", group = G_CORE)
+tradeSess = input.session("0100-1555", "Trading day (NY time) – flat outside", group = G_CORE)
+targetR   = input.float(0.5, "Target (R multiple)", minval = 0.1, step = 0.1, group = G_CORE)
+fullBody  = input.bool(false, "Require the whole candle body outside the range", group = G_CORE)
+firstOnly = input.bool(true, "Only the first breakout of the day counts (also if filtered)", group = G_CORE)
+
+sizeMode     = input.string("Fixed contracts", "Sizing mode", options = ["Fixed contracts", "Fixed $ risk"], group = G_SIZE)
+contracts    = input.int(1, "Contracts (fixed mode)", minval = 1, group = G_SIZE)
+riskUsd      = input.float(100.0, "$ risk per trade ($ risk mode)", minval = 1, group = G_SIZE)
+maxContracts = input.int(20, "Max contracts ($ risk mode)", minval = 1, group = G_SIZE)
+
+startTime = input.time(timestamp("01 Jan 2015 00:00 +0000"), "Start", group = G_DATE)
+endTime   = input.time(timestamp("31 Dec 2099 00:00 +0000"), "End", group = G_DATE)
+
+filterMode  = input.string(F0, "Active filter", options = [F0, F1, F2, F3, F4, F5], group = G_F)
+trendLen    = input.int(50, "F1: daily EMA length", minval = 2, group = G_F)
+atrShort    = input.int(14, "F2/F3: daily ATR short length", minval = 2, group = G_F)
+atrLong     = input.int(100, "F2: daily ATR long length", minval = 5, group = G_F)
+volRatio    = input.float(1.0, "F2: trade only if ATR short > ratio × ATR long", step = 0.05, group = G_F)
+minRangeAtr = input.float(0.05, "F3: min range width (× daily ATR)", step = 0.01, group = G_F)
+maxRangeAtr = input.float(0.25, "F3: max range width (× daily ATR)", step = 0.01, group = G_F)
+vixSym      = input.symbol("TVC:VIX", "F4: VIX symbol", group = G_F)
+vixMin      = input.float(12.0, "F4: min VIX (prior close)", group = G_F)
+vixMax      = input.float(25.0, "F4: max VIX (prior close)", group = G_F)
+adxLen      = input.int(14, "F5: daily ADX length", minval = 2, group = G_F)
+adxMin      = input.float(20.0, "F5: trade only if daily ADX >", group = G_F)
+
+if barstate.isfirst and timeframe.period != "5"
+    runtime.error("This strategy is designed for a 5-minute chart.")
+
+// ───────────────────────────── Sessions ─────────────────────────────
+inRange = not na(time(timeframe.period, rangeSess + ":1234567", TZ))
+inEntry = not na(time(timeframe.period, entrySess + ":1234567", TZ))
+inTrade = not na(time(timeframe.period, tradeSess + ":1234567", TZ))
+inDates = time >= startTime and time <= endTime
+
+// ───────────────────────────── Range ─────────────────────────────
+var float rHigh        = na
+var float rLow         = na
+var bool  rangeReady   = false
+var bool  breakoutSeen = false
+var bool  tradedToday  = false
+var float stopPx       = na
+var float tgtPx        = na
+var array<float> riskArr = array.new<float>()  // planned $ risk per trade, for R statistics
+
+if inRange and not inRange[1]
+    rHigh        := high
+    rLow         := low
+    rangeReady   := false
+    breakoutSeen := false
+    tradedToday  := false
+else if inRange
+    rHigh := math.max(rHigh, high)
+    rLow  := math.min(rLow, low)
+
+if inRange[1] and not inRange and not na(rHigh)
+    rangeReady := true
+
+rangeW = rHigh - rLow
+
+// ───────────────────────────── Regime data (previous completed day only) ─────────────────────────────
+f_adx(len) =>
+    [diPlus, diMinus, adxVal] = ta.dmi(len, len)
+    adxVal[1]
+
+dClose1 = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_on)
+dEma1   = request.security(syminfo.tickerid, "D", ta.ema(close, trendLen)[1], lookahead = barmerge.lookahead_on)
+dAtrS1  = request.security(syminfo.tickerid, "D", ta.atr(atrShort)[1], lookahead = barmerge.lookahead_on)
+dAtrL1  = request.security(syminfo.tickerid, "D", ta.atr(atrLong)[1], lookahead = barmerge.lookahead_on)
+dAdx1   = request.security(syminfo.tickerid, "D", f_adx(adxLen), lookahead = barmerge.lookahead_on)
+vix1    = request.security(vixSym, "D", close[1], lookahead = barmerge.lookahead_on)
+
+allowLong  = true
+allowShort = true
+switch filterMode
+    F1 =>
+        allowLong  := dClose1 > dEma1
+        allowShort := dClose1 < dEma1
+    F2 =>
+        ok2 = dAtrS1 > volRatio * dAtrL1
+        allowLong  := ok2
+        allowShort := ok2
+    F3 =>
+        rel = rangeW / dAtrS1
+        ok3 = rel >= minRangeAtr and rel <= maxRangeAtr
+        allowLong  := ok3
+        allowShort := ok3
+    F4 =>
+        ok4 = vix1 >= vixMin and vix1 <= vixMax
+        allowLong  := ok4
+        allowShort := ok4
+    F5 =>
+        ok5 = dAdx1 > adxMin
+        allowLong  := ok5
+        allowShort := ok5
+
+// ───────────────────────────── Entries ─────────────────────────────
+f_qty(float riskPts) =>
+    float q = contracts
+    if sizeMode == "Fixed $ risk"
+        q := math.min(maxContracts, math.floor(riskUsd / (riskPts * syminfo.pointvalue)))
+    q
+
+flat      = strategy.position_size == 0
+canSignal = rangeReady and inEntry and inTrade and inDates and not inRange and not breakoutSeen and not tradedToday and flat
+upBreak   = fullBody ? math.min(open, close) > rHigh : close > rHigh
+dnBreak   = fullBody ? math.max(open, close) < rLow : close < rLow
+
+if canSignal and (upBreak or dnBreak)
+    if firstOnly
+        breakoutSeen := true
+    if upBreak and allowLong
+        riskPts = close - rLow
+        q = f_qty(riskPts)
+        if riskPts > 0 and q >= 1
+            stopPx := rLow
+            tgtPx  := close + targetR * riskPts
+            strategy.entry("Long", strategy.long, qty = q)
+            strategy.exit("Long exit", "Long", stop = stopPx, limit = tgtPx)
+            riskArr.push(riskPts * syminfo.pointvalue * q)
+            tradedToday  := true
+            breakoutSeen := true
+    else if dnBreak and allowShort
+        riskPts = rHigh - close
+        q = f_qty(riskPts)
+        if riskPts > 0 and q >= 1
+            stopPx := rHigh
+            tgtPx  := close - targetR * riskPts
+            strategy.entry("Short", strategy.short, qty = q)
+            strategy.exit("Short exit", "Short", stop = stopPx, limit = tgtPx)
+            riskArr.push(riskPts * syminfo.pointvalue * q)
+            tradedToday  := true
+            breakoutSeen := true
+
+// Re-anchor the 0.5R target to the actual fill price once the position is open.
+if strategy.position_size > 0
+    r = strategy.position_avg_price - stopPx
+    if r <= 0
+        strategy.close("Long", comment = "Filled beyond stop")
+    else
+        tgtPx := strategy.position_avg_price + targetR * r
+        strategy.exit("Long exit", "Long", stop = stopPx, limit = tgtPx)
+if strategy.position_size < 0
+    r = stopPx - strategy.position_avg_price
+    if r <= 0
+        strategy.close("Short", comment = "Filled beyond stop")
+    else
+        tgtPx := strategy.position_avg_price - targetR * r
+        strategy.exit("Short exit", "Short", stop = stopPx, limit = tgtPx)
+
+// Neither stop nor target hit by the end of the trading day -> flat.
+if strategy.position_size != 0 and not inTrade
+    strategy.close_all(comment = "End of day")
+
+// ───────────────────────────── Visuals ─────────────────────────────
+bgcolor(inRange ? color.new(color.blue, 85) : na, title = "Range window")
+plot(rangeReady and inTrade ? rHigh : na, "Range high", color.new(color.teal, 0), 1, plot.style_linebr)
+plot(rangeReady and inTrade ? rLow : na, "Range low", color.new(color.maroon, 0), 1, plot.style_linebr)
+plot(strategy.position_size != 0 ? stopPx : na, "Stop", color.red, 2, plot.style_linebr)
+plot(strategy.position_size != 0 ? tgtPx : na, "Target", color.lime, 2, plot.style_linebr)
+
+// ───────────────────────────── Statistics in R ─────────────────────────────
+var table tbl = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 15), border_width = 1)
+if barstate.islast
+    n = strategy.closedtrades
+    m = math.min(n, riskArr.size())
+    float sumR    = 0.0
+    float sumCost = 0.0
+    float sumSq   = 0.0
+    int   wins    = 0
+    if m > 0
+        for i = 0 to m - 1
+            rUsd = riskArr.get(i)
+            tradeR   = strategy.closedtrades.profit(i) / rUsd
+            sumR    += tradeR
+            sumSq   += tradeR * tradeR
+            sumCost += strategy.closedtrades.commission(i) / rUsd
+            wins    += strategy.closedtrades.profit(i) > 0 ? 1 : 0
+    meanR = m > 0 ? sumR / m : na
+    sdR   = m > 1 ? math.sqrt(math.max(sumSq - m * meanR * meanR, 0.0) / (m - 1)) : na
+    tStat = m > 1 and sdR > 0 ? meanR / sdR * math.sqrt(m) : na
+    beGross = 1.0 / (1.0 + targetR)
+    table.cell(tbl, 0, 0, "Filter", text_color = color.white)
+    table.cell(tbl, 1, 0, filterMode, text_color = color.white)
+    table.cell(tbl, 0, 1, "Closed trades", text_color = color.white)
+    table.cell(tbl, 1, 1, str.tostring(n), text_color = color.white)
+    table.cell(tbl, 0, 2, "Win rate", text_color = color.white)
+    table.cell(tbl, 1, 2, m > 0 ? str.tostring(100.0 * wins / m, "#.0") + " %" : "–", text_color = color.white)
+    table.cell(tbl, 0, 3, "Break-even win rate (before costs)", text_color = color.white)
+    table.cell(tbl, 1, 3, str.tostring(100.0 * beGross, "#.0") + " %", text_color = color.white)
+    table.cell(tbl, 0, 4, "Avg net result per trade (R)", text_color = color.white)
+    table.cell(tbl, 1, 4, m > 0 ? str.tostring(sumR / m, "#.000") : "–", text_color = color.white)
+    table.cell(tbl, 0, 5, "Avg commission per trade (R)", text_color = color.white)
+    table.cell(tbl, 1, 5, m > 0 ? str.tostring(sumCost / m, "#.000") : "–", text_color = color.white)
+    table.cell(tbl, 0, 6, "t-stat of avg R (|t| > 2 needed, > 3 better)", text_color = color.white)
+    table.cell(tbl, 1, 6, na(tStat) ? "–" : str.tostring(tStat, "#.00"), text_color = color.white)
